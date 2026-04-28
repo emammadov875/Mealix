@@ -4,14 +4,12 @@ import base64
 import os
 import json
 import re
-from io import BytesIO
 
 import httpx
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -23,7 +21,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction, ParseMode
 
-from config import TELEGRAM_TOKEN, GEMINI_API_KEY
+from config import TELEGRAM_TOKEN, OPENROUTER_API_KEY
 from database import Database
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -33,42 +31,98 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Gemini helpers ─────────────────────────────────────────────────────────────
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-)
-HEADERS = {"Content-Type": "application/json"}
+# ── OpenRouter config ──────────────────────────────────────────────────────────
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_HEADERS = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json",
+    "HTTP-Referer": "https://fridgechefbot.app",  # any URL is fine
+    "X-Title": "Fridge Chef Bot",
+}
+
+# Free models — bot tries them in order if one fails/rate-limits
+FREE_TEXT_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+]
+
+# Best free vision model for image recognition
+FREE_VISION_MODEL = "google/gemini-2.0-flash-exp:free"
 
 
-async def call_gemini(parts: list, timeout: int = 30) -> str:
-    payload = {"contents": [{"parts": parts}]}
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(GEMINI_URL, headers=HEADERS, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+# ── OpenRouter API call ────────────────────────────────────────────────────────
 
+async def call_openrouter(
+    messages: list,
+    model: str,
+    timeout: int = 60,
+    retries: int = 3,
+) -> str:
+    """Call OpenRouter with exponential backoff on 429s."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 1500,
+    }
+    delay = 5
+    for attempt in range(retries):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(OPENROUTER_URL, headers=OPENROUTER_HEADERS, json=payload)
+            if r.status_code == 429:
+                wait = delay * (2 ** attempt)
+                logger.warning(f"OpenRouter 429 on {model} — waiting {wait}s (attempt {attempt+1}/{retries})")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+    raise Exception(f"Rate limited on {model} after {retries} retries.")
+
+
+async def call_with_fallback(messages: list, timeout: int = 60) -> str:
+    """Try each free text model in order until one succeeds."""
+    last_err = None
+    for model in FREE_TEXT_MODELS:
+        try:
+            logger.info(f"Trying model: {model}")
+            return await call_openrouter(messages, model, timeout)
+        except Exception as e:
+            logger.warning(f"Model {model} failed: {e}")
+            last_err = e
+    raise Exception(
+        "⏳ All free models are busy right now. Please wait a moment and try again."
+    )
+
+
+# ── AI functions ───────────────────────────────────────────────────────────────
 
 async def identify_ingredients_from_image(image_bytes: bytes) -> str:
     b64 = base64.b64encode(image_bytes).decode()
-    parts = [
+    messages = [
         {
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": b64,
-            }
-        },
-        {
-            "text": (
-                "You are a kitchen assistant. Look at this fridge/pantry image carefully. "
-                "List ALL visible food ingredients you can identify. "
-                "Return ONLY a comma-separated list of ingredients, nothing else. "
-                "Example: eggs, milk, cheese, tomatoes, onions"
-            )
-        },
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}"
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "You are a kitchen assistant. Look at this fridge/pantry image carefully. "
+                        "List ALL visible food ingredients you can identify. "
+                        "Return ONLY a comma-separated list of ingredients, nothing else. "
+                        "Example: eggs, milk, cheese, tomatoes, onions"
+                    ),
+                },
+            ],
+        }
     ]
-    return await call_gemini(parts)
+    # Vision requires a vision-capable model
+    return await call_openrouter(messages, FREE_VISION_MODEL, timeout=60)
 
 
 async def generate_recipes(
@@ -76,14 +130,17 @@ async def generate_recipes(
 ) -> str:
     fav_note = ""
     if favorites:
-        fav_note = f"\nThe user previously saved these favourites: {', '.join(favorites[:5])}. Try to suggest something different."
-
+        fav_note = f"\nThe user previously saved: {', '.join(favorites[:5])}. Suggest something different."
     dietary_note = f"\nDietary preference: {dietary}." if dietary != "none" else ""
 
-    parts = [
+    messages = [
         {
-            "text": f"""You are a world-class chef and nutritionist.
-The user has these ingredients: {ingredients}{dietary_note}{fav_note}
+            "role": "system",
+            "content": "You are a world-class chef and nutritionist. Be concise, practical and use emojis.",
+        },
+        {
+            "role": "user",
+            "content": f"""The user has these ingredients: {ingredients}{dietary_note}{fav_note}
 
 Generate exactly 3 creative recipes using ONLY (or mostly) these ingredients.
 For each recipe provide:
@@ -105,28 +162,31 @@ For each recipe provide:
 
 ---
 
-Make the recipes practical, delicious and varied (e.g. one quick, one hearty, one creative).
-Use emojis to make it visually appealing. Keep each recipe concise but complete."""
-        }
+Make recipes varied (one quick, one hearty, one creative). Keep each concise but complete.""",
+        },
     ]
-    return await call_gemini(parts)
+    return await call_with_fallback(messages)
 
 
 async def generate_meal_plan(ingredients: str, dietary: str = "none") -> str:
     dietary_note = f"Dietary preference: {dietary}." if dietary != "none" else ""
-    parts = [
+    messages = [
         {
-            "text": f"""You are a professional nutritionist.
-Available ingredients: {ingredients}
+            "role": "system",
+            "content": "You are a professional nutritionist. Be concise and use emojis.",
+        },
+        {
+            "role": "user",
+            "content": f"""Available ingredients: {ingredients}
 {dietary_note}
 
 Create a 5-day meal plan (Mon–Fri) using these ingredients.
 Format:
 **Day** | Breakfast | Lunch | Dinner
-Keep it short, practical and nutritious. Use emojis."""
-        }
+Keep it short, practical and nutritious.""",
+        },
     ]
-    return await call_gemini(parts)
+    return await call_with_fallback(messages)
 
 
 # ── Database singleton ─────────────────────────────────────────────────────────
@@ -229,7 +289,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # Basic validation — must look like ingredients
     if len(text) < 3 or len(text) > 500:
         await update.message.reply_text(
             "Please send a list of ingredients, e.g.:\n`eggs, cheese, tomatoes, onion`"
@@ -237,11 +296,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["ingredients"] = text
-    context.user_data["last_message_id"] = update.message.message_id
     dietary = db.get_dietary(uid) or "none"
 
     await update.message.chat.send_action(ChatAction.TYPING)
-
     thinking_msg = await update.message.reply_text("🔍 Analysing your ingredients...")
 
     try:
@@ -256,7 +313,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Recipe generation error: {e}")
         await thinking_msg.edit_text(
-            "❌ Oops! Something went wrong. Please try again in a moment."
+            str(e) if "busy" in str(e).lower() or "rate" in str(e).lower()
+            else "❌ Something went wrong. Please try again in a moment."
         )
 
 
@@ -269,7 +327,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # Get highest resolution photo
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
 
@@ -297,7 +354,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         recipes = await generate_recipes(ingredients, dietary, db.get_favourites(uid))
-
         await thinking_msg.delete()
         await update.message.reply_text(
             f"🥦 *Detected ingredients:* {ingredients}\n\n"
@@ -310,7 +366,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Photo handler error: {e}")
         await thinking_msg.edit_text(
-            "❌ Couldn't process the image. Please try again or type ingredients manually."
+            str(e) if "busy" in str(e).lower() or "rate" in str(e).lower()
+            else "❌ Couldn't process the image. Please try again or type ingredients manually."
         )
 
 
@@ -322,7 +379,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
     data = query.data
 
-    # ── Dietary selection ──
     if data.startswith("diet_"):
         pref = data.replace("diet_", "")
         db.set_dietary(uid, pref)
@@ -334,13 +390,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Save favourite ──
     if data == "save_fav":
         recipes_text = context.user_data.get("last_recipes", "")
         if not recipes_text:
             await query.answer("No recipes to save!", show_alert=True)
             return
-        # Extract first recipe name from text
         lines = recipes_text.strip().split("\n")
         recipe_name = "Unknown Recipe"
         for line in lines:
@@ -352,13 +406,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"⭐ Saved: {recipe_name[:30]}...", show_alert=False)
         return
 
-    # ── New recipes ──
     if data == "new_recipes":
         ingredients = context.user_data.get("ingredients")
         if not ingredients:
-            await query.edit_message_text(
-                "Please send me your ingredients first! 🥦"
-            )
+            await query.edit_message_text("Please send me your ingredients first! 🥦")
             return
         dietary = db.get_dietary(uid) or "none"
         await query.edit_message_text("🔄 Generating new recipe ideas...")
@@ -372,10 +423,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(e)
-            await query.edit_message_text("❌ Failed to generate. Try again!")
+            await query.edit_message_text(
+                str(e) if "busy" in str(e).lower() else "❌ Failed to generate. Try again!"
+            )
         return
 
-    # ── Meal plan ──
     if data == "meal_plan":
         ingredients = context.user_data.get("ingredients")
         if not ingredients:
@@ -394,10 +446,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(e)
-            await query.edit_message_text("❌ Failed to generate plan. Try again!")
+            await query.edit_message_text(
+                str(e) if "busy" in str(e).lower() else "❌ Failed to generate plan. Try again!"
+            )
         return
 
-    # ── Show favourites ──
     if data == "show_favs":
         favs = db.get_favourites(uid)
         if not favs:
@@ -419,7 +472,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Utility ────────────────────────────────────────────────────────────────────
 
 def escape_md(text: str) -> str:
-    """Escape special characters for MarkdownV2."""
     escape_chars = r"\_*[]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
@@ -429,18 +481,15 @@ def escape_md(text: str) -> str:
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("diet", diet_command))
     app.add_handler(CommandHandler("favourites", favourites_command))
     app.add_handler(CommandHandler("clear", clear_command))
 
-    # Messages
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("🚀 Fridge Chef Bot is running...")
@@ -448,11 +497,9 @@ def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     import sys
 
     if sys.version_info >= (3, 10):
-        # Python 3.10+ (including 3.14) — explicitly create and set event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
