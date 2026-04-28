@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ── Gemini helpers ─────────────────────────────────────────────────────────────
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 )
 HEADERS = {"Content-Type": "application/json"}
 
