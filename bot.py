@@ -82,7 +82,7 @@ async def generate_recipes(
 
     parts = [
         {
-            "text": f"""You are a world-class chef and nutritionist. 
+            "text": f"""You are a world-class chef and nutritionist.
 The user has these ingredients: {ingredients}{dietary_note}{fav_note}
 
 Generate exactly 3 creative recipes using ONLY (or mostly) these ingredients.
@@ -448,4 +448,12 @@ def main():
 
 
 if __name__ == "__main__":
+    import asyncio
+    import sys
+
+    if sys.version_info >= (3, 10):
+        # Python 3.10+ (including 3.14) — explicitly create and set event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     main()
